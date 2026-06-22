@@ -1,4 +1,5 @@
-import type { Step, ActionResult } from '@/types/agent';
+import type { Step, ActionResult, ElementTarget } from '@/types/agent';
+import type { Planner } from './planner';
 import { ActionRunner } from '@/browser/action-runner';
 import { BrowserManager } from '@/browser/browser-manager';
 import { PageAnalyzer } from '@/browser/page-analyzer';
@@ -12,7 +13,8 @@ export class Executor {
 
   constructor(
     private browserManager: BrowserManager,
-    private memory: AgentMemory
+    private memory: AgentMemory,
+    private planner?: Planner
   ) {
     this.analyzer = new PageAnalyzer();
   }
@@ -26,13 +28,20 @@ export class Executor {
       Logger.info(`[${i + 1}/${steps.length}] ${step.description}`);
 
       const result = await this.executeWithRetry(step, i);
+
       if (!result.success) {
         Logger.error(`Step ${i + 1} failed after retry: ${result.error}`);
         this.memory.addError(`Step ${i + 1} (${step.action}): ${result.error}`);
-        this.memory.setStatus('failed');
-
         await this.captureErrorScreenshot();
-        return;
+
+        const recovered = await this.tryRecovery(step, i);
+        if (!recovered) {
+          this.memory.setStatus('failed');
+          return;
+        }
+        Logger.success(`Recovered from step ${i + 1} failure`);
+        this.memory.addCompletedAction(`${step.action}: ${step.description} (recovered)`);
+        continue;
       }
 
       this.memory.addCompletedAction(`${step.action}: ${step.description}`);
@@ -41,6 +50,74 @@ export class Executor {
     this.memory.setStatus('completed');
     Logger.separator();
     Logger.success('All steps executed successfully');
+  }
+
+  private async tryRecovery(failedStep: Step, index: number): Promise<boolean> {
+    Logger.info('Attempting recovery from step failure...');
+
+    if (this.planner && this.memory.getState().pageAnalysis) {
+      try {
+        const recoveryTask = `Recover from failed step: ${failedStep.description}. Error context: ${this.memory.getState().errors[this.memory.getState().errors.length - 1]}`;
+        const recoveryPlan = await this.planner.generateRecoveryPlan(
+          recoveryTask,
+          this.memory.getState().pageAnalysis!,
+          failedStep
+        );
+
+        if (recoveryPlan.steps.length > 0) {
+          Logger.info(`Executing ${recoveryPlan.steps.length} recovery steps...`);
+          for (const recoveryStep of recoveryPlan.steps) {
+            const r = await this.executeWithRetry(recoveryStep, index);
+            if (!r.success) {
+              Logger.warn(`Recovery step failed: ${r.error}`);
+              return false;
+            }
+            this.memory.addCompletedAction(`[recovery] ${recoveryStep.description}`);
+          }
+          return true;
+        }
+      } catch (error) {
+        Logger.warn(`Recovery planning failed: ${String(error)}`);
+      }
+    }
+
+    const fallbackStep = this.generateFallbackStep(failedStep);
+    if (fallbackStep) {
+      Logger.info('Trying fallback coordinate-based approach...');
+      const result = await this.executeWithRetry(fallbackStep, index);
+      return result.success;
+    }
+
+    return false;
+  }
+
+  private generateFallbackStep(failedStep: Step): Step | null {
+    const analysis = this.memory.getState().pageAnalysis;
+    if (!analysis) return null;
+
+    const params = failedStep.params || {};
+    const targetLabel = (params.target as ElementTarget) || {};
+    const coords = targetLabel.coordinates;
+
+    if (coords) {
+      return {
+        action: 'click_on_screen',
+        params: { x: coords.x, y: coords.y },
+        description: `Fallback coordinate click at (${coords.x}, ${coords.y})`,
+      };
+    }
+
+    const allElements = [...analysis.inputs, ...analysis.textareas, ...analysis.buttons];
+    if (allElements.length > 0) {
+      const el = allElements[0];
+      return {
+        action: 'click_on_screen',
+        params: { x: el.rect.centerX, y: el.rect.centerY },
+        description: `Fallback click on ${el.tag} at (${el.rect.centerX}, ${el.rect.centerY})`,
+      };
+    }
+
+    return null;
   }
 
   private async executeWithRetry(step: Step, index: number): Promise<ActionResult> {
@@ -100,6 +177,12 @@ export class Executor {
       case 'click_on_screen':
         return this.runner.click(params.x as number, params.y as number);
 
+      case 'click_element':
+        return this.runner.clickElement(params.target as ElementTarget);
+
+      case 'focus_element':
+        return this.runner.focusElement(params.target as ElementTarget);
+
       case 'double_click':
         return this.runner.doubleClick(params.x as number, params.y as number);
 
@@ -112,13 +195,23 @@ export class Executor {
       case 'scroll':
         return this.runner.scroll(params.amount as number);
 
+      case 'reanalyze_page': {
+        const page = this.browserManager.getPage();
+        await page.waitForTimeout(500);
+        const analysis = await this.analyzer.analyze(page);
+        this.memory.setPageAnalysis(analysis);
+        this.memory.setUrl(page.url());
+        return { success: true, data: analysis };
+      }
+
       case 'verify_fill': {
         const page = this.browserManager.getPage();
         const expectedValues = Array.isArray(params.expectedValues)
           ? params.expectedValues.filter((value): value is string => typeof value === 'string')
           : [];
-        const values = await page.locator('input, textarea').evaluateAll((elements) =>
-          elements.map((element) => (element as HTMLInputElement).value)
+        const values = await page.locator('input, textarea').evaluateAll(
+          (elements: Element[]) =>
+            elements.map((element) => (element as HTMLInputElement).value)
         );
         Logger.info('Non-empty field values after fill: ' + JSON.stringify(values.filter(Boolean)));
         const missing = expectedValues.filter((expected) => !values.includes(expected));

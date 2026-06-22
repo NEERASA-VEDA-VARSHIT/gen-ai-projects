@@ -1,8 +1,9 @@
-import type { Page } from 'playwright';
+import type { Page, Locator } from 'playwright';
 import path from 'path';
 import fs from 'fs';
 import { Logger } from '@/logger/logger';
-import type { ActionResult } from '@/types/agent';
+import type { ActionResult, ElementTarget } from '@/types/agent';
+import { ElementFinder } from './element-finder';
 
 const SCREENSHOT_DIR = path.resolve(process.cwd(), 'screenshots');
 
@@ -13,7 +14,11 @@ function ensureDir(dir: string): void {
 }
 
 export class ActionRunner {
-  constructor(private page: Page) {}
+  private finder: ElementFinder;
+
+  constructor(private page: Page) {
+    this.finder = new ElementFinder(page);
+  }
 
   async navigate(url: string): Promise<ActionResult> {
     try {
@@ -54,13 +59,72 @@ export class ActionRunner {
     }
   }
 
+  async clickElement(target: ElementTarget): Promise<ActionResult> {
+    try {
+      Logger.info(`Finding element: ${target.selector || target.label || target.placeholder || 'coordinates'}`);
+      const result = await this.finder.find(target);
+
+      if (!result.success) {
+        return { success: false, error: 'Element not found by any strategy' };
+      }
+
+      if (result.method === 'coordinate' && target.coordinates) {
+        return this.click(target.coordinates.x, target.coordinates.y);
+      }
+
+      if (result.locator) {
+        await result.locator.scrollIntoViewIfNeeded();
+        await this.page.waitForTimeout(200);
+        await result.locator.click();
+        await this.page.waitForTimeout(200);
+        Logger.success(`Clicked element via ${result.method}`);
+        return { success: true, data: { method: result.method } };
+      }
+
+      return { success: false, error: 'No locator resolved' };
+    } catch (error) {
+      Logger.error(`clickElement failed: ${String(error)}`);
+      return { success: false, error: String(error) };
+    }
+  }
+
+  async focusElement(target: ElementTarget): Promise<ActionResult> {
+    try {
+      Logger.info(`Focusing element: ${target.selector || target.label || target.placeholder || 'coordinates'}`);
+      const result = await this.finder.find(target);
+
+      if (!result.success) {
+        return { success: false, error: 'Element not found for focus' };
+      }
+
+      if (result.method === 'coordinate' && target.coordinates) {
+        const clickResult = await this.click(target.coordinates.x, target.coordinates.y);
+        return clickResult;
+      }
+
+      if (result.locator) {
+        await result.locator.scrollIntoViewIfNeeded();
+        await this.page.waitForTimeout(200);
+        await result.locator.focus();
+        await this.page.waitForTimeout(100);
+        Logger.success(`Focused element via ${result.method}`);
+        return { success: true, data: { method: result.method } };
+      }
+
+      return { success: false, error: 'No locator resolved' };
+    } catch (error) {
+      Logger.error(`focusElement failed: ${String(error)}`);
+      return { success: false, error: String(error) };
+    }
+  }
+
   async doubleClick(x: number, y: number): Promise<ActionResult> {
     try {
       if (!Number.isFinite(x) || !Number.isFinite(y)) {
         throw new Error(`Invalid document coordinates: (${x}, ${y})`);
       }
       Logger.info(`Double-clicking at document position (${x}, ${y})`);
-      await this.page.evaluate((cy) => {
+      await this.page.evaluate((cy: number) => {
         window.scrollTo({ top: Math.max(0, cy - window.innerHeight / 2), behavior: 'instant' });
       }, y);
       await this.page.waitForTimeout(300);

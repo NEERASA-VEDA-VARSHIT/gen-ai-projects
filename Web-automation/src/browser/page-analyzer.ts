@@ -11,6 +11,7 @@ interface RawElement {
   ariaLabel: string | null;
   textContent: string | null;
   labelText: string | null;
+  selector: string;
   rect: {
     x: number;
     y: number;
@@ -51,6 +52,35 @@ export class PageAnalyzer {
             htmlFor: _el.htmlFor || null,
           });
         }
+      }
+
+      function _buildSelector(__el) {
+        if (__el.id) return '#' + CSS.escape(__el.id);
+        if (__el.getAttribute('name')) {
+          return __el.tagName.toLowerCase() + '[name="' + CSS.escape(__el.getAttribute('name')) + '"]';
+        }
+        if (__el.getAttribute('data-testid')) {
+          return '[data-testid="' + CSS.escape(__el.getAttribute('data-testid')) + '"]';
+        }
+        if (__el.getAttribute('aria-label')) {
+          return __el.tagName.toLowerCase() + '[aria-label="' + CSS.escape(__el.getAttribute('aria-label')) + '"]';
+        }
+        var _path = [];
+        var _current = __el;
+        while (_current && _current !== document.body && _current !== document.documentElement) {
+          var _tag = _current.tagName.toLowerCase();
+          var _parent = _current.parentElement;
+          if (_parent) {
+            var _siblings = Array.from(_parent.children).filter(function (s) { return s.tagName === _current.tagName; });
+            if (_siblings.length > 1) {
+              var _idx = _siblings.indexOf(_current) + 1;
+              _tag += ':nth-of-type(' + _idx + ')';
+            }
+          }
+          _path.unshift(_tag);
+          _current = _current.parentElement;
+        }
+        return _path.join(' > ') || __el.tagName.toLowerCase();
       }
 
       function _extract(__el) {
@@ -98,6 +128,7 @@ export class PageAnalyzer {
           ariaLabel: __el.getAttribute('aria-label'),
           textContent: (__el.textContent || '').trim() || null,
           labelText: _labelText,
+          selector: _buildSelector(__el),
           rect: {
             x: Math.round(_docX),
             y: Math.round(_docY),

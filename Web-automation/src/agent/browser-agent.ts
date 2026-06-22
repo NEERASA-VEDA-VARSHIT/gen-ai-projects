@@ -25,7 +25,7 @@ export class BrowserAgent {
     }
     this.planner = new Planner(llm);
     this.memory = new AgentMemory();
-    this.executor = new Executor(this.browserManager, this.memory);
+    this.executor = new Executor(this.browserManager, this.memory, this.planner);
   }
 
   async run(task: string, url: string): Promise<AgentRunResult> {

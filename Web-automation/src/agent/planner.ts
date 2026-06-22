@@ -1,4 +1,4 @@
-import type { Step, PlanResult, PageAnalysis } from '@/types/agent';
+import type { Step, PlanResult, PageAnalysis, ElementTarget, PageElement } from '@/types/agent';
 import type { LLMProvider } from '@/llm/types';
 import { Logger } from '@/logger/logger';
 
@@ -19,19 +19,144 @@ export class Planner {
     return this.planWithHeuristics(task, analysis);
   }
 
+  async generateRecoveryPlan(
+    task: string,
+    analysis: PageAnalysis,
+    failedStep: Step
+  ): Promise<PlanResult> {
+    Logger.info('Generating recovery plan...');
+
+    if (this.llm) {
+      try {
+        return await this.planRecoveryWithLLM(task, analysis, failedStep);
+      } catch (error) {
+        Logger.warn(`LLM recovery planning failed: ${String(error)}`);
+      }
+    }
+
+    return this.planRecoveryWithHeuristics(analysis, failedStep);
+  }
+
+  private async planRecoveryWithLLM(
+    task: string,
+    analysis: PageAnalysis,
+    failedStep: Step
+  ): Promise<PlanResult> {
+    const allFields = this.serializeFields(analysis);
+
+    const prompt = `You are a browser automation agent recovering from a failed step.
+
+Page URL: ${analysis.url}
+Page Title: ${analysis.title}
+
+Recovery Task: ${task}
+
+Failed Step: ${JSON.stringify(failedStep)}
+
+Detected form fields:
+${JSON.stringify(allFields, null, 2)}
+
+Detected Labels:
+${JSON.stringify(analysis.labels, null, 2)}
+
+The previous approach failed. Try a different strategy:
+1. Use click_element with a different target property (try label instead of selector, or placeholder instead of label)
+2. Consider using a broader selector or different text matching
+3. If the page may have changed, use reanalyze_page first
+4. As last resort, use click_on_screen with coordinates
+
+Available actions: click_element, focus_element, send_keys, press_enter, click_on_screen, reanalyze_page, take_screenshot, scroll.
+
+For click_element, use:
+{ "action": "click_element", "params": { "target": { "selector": "#id", "label": "Email", "placeholder": "Enter email" } }, "description": "Click email field" }
+
+Respond with a valid JSON object:
+{
+  "reasoning": "Explain the recovery approach",
+  "steps": [ ... ]
+}
+
+Return ONLY valid JSON. No markdown.`;
+
+    if (!this.llm) throw new Error('LLM not available');
+    const result = await this.llm.generateJSON<PlanResult>(prompt);
+    this.validatePlan(result, true);
+    Logger.info(`LLM generated ${result.steps.length} recovery steps`);
+    return result;
+  }
+
+  private planRecoveryWithHeuristics(
+    analysis: PageAnalysis,
+    failedStep: Step
+  ): PlanResult {
+    const steps: Step[] = [];
+    const allElements = [...analysis.inputs, ...analysis.textareas, ...analysis.buttons];
+
+    if (allElements.length === 0) {
+      steps.push({
+        action: 'reanalyze_page',
+        description: 'Re-analyze page to get fresh element data',
+      });
+      return { reasoning: 'No elements found, re-analyzing page', steps };
+    }
+
+    const failedTarget = failedStep.params?.target as ElementTarget | undefined;
+    const failedCoords = failedStep.params as { x?: number; y?: number } | undefined;
+
+    if (failedTarget) {
+      const targetPriority: Array<keyof ElementTarget> = ['selector', 'label', 'placeholder', 'ariaLabel', 'textContent', 'name', 'id'];
+
+      for (const key of targetPriority) {
+        if (failedTarget[key]) {
+          const alternateKey = targetPriority.find((k) => k !== key && failedTarget[k]);
+          if (alternateKey) {
+            steps.push({
+              action: 'click_element',
+              params: {
+                target: {
+                  [alternateKey]: failedTarget[alternateKey],
+                  coordinates: failedTarget.coordinates,
+                },
+              },
+              description: `Retry click via ${alternateKey}: ${failedTarget[alternateKey]}`,
+            });
+            return { reasoning: `Switching to ${alternateKey} strategy`, steps };
+          }
+        }
+      }
+    }
+
+    if (failedCoords && typeof failedCoords.x === 'number' && typeof failedCoords.y === 'number') {
+      const nearby = allElements.find(
+        (el) => Math.abs(el.rect.centerX - failedCoords.x!) < 100 && Math.abs(el.rect.centerY - failedCoords.y!) < 100
+      );
+      if (nearby) {
+        steps.push({
+          action: 'click_element',
+          params: {
+            target: {
+              selector: nearby.selector,
+              label: nearby.labelText || undefined,
+              placeholder: nearby.placeholder || undefined,
+              coordinates: { x: nearby.rect.centerX, y: nearby.rect.centerY },
+            },
+          },
+          description: `Recovery click on ${nearby.tag}: ${nearby.labelText || nearby.placeholder || nearby.selector}`,
+        });
+        return { reasoning: `Found nearby element for recovery`, steps };
+      }
+    }
+
+    steps.push({
+      action: 'reanalyze_page',
+      description: 'Re-analyze page for recovery',
+    });
+
+    return { reasoning: 'Attempting to re-analyze page', steps };
+  }
+
   private async planWithLLM(task: string, analysis: PageAnalysis): Promise<PlanResult> {
-    const allFields = [...analysis.inputs, ...analysis.textareas].map((f, idx) => ({
-      index: idx,
-      tag: f.tag,
-      type: f.type,
-      placeholder: f.placeholder,
-      labelText: f.labelText,
-      name: f.name,
-      id: f.id,
-      ariaLabel: f.ariaLabel,
-      centerX: Math.round(f.rect.centerX),
-      centerY: Math.round(f.rect.centerY),
-    }));
+    const allFields = this.serializeFields(analysis);
 
     const prompt = `You are a browser automation agent. Your goal is to execute the user's task on a web page.
 
@@ -48,19 +173,23 @@ ${JSON.stringify(analysis.labels, null, 2)}
 
 Instructions:
 1. Analyze the user's task to determine what text to type and which fields to type into.
-2. Match fields by their label text, placeholder, aria-label, name, or id attributes.
-3. Generate a step-by-step plan: click to focus each field, then type the appropriate text.
-4. Use the exact centerX and centerY coordinates from the detected elements for click_on_screen actions.
-5. If the task involves searching or submitting, include a press_enter step after typing.
-6. End with a verify_fill step listing the text values that were typed, followed by a take_screenshot step.
+2. Match fields by their label text, placeholder, aria-label, name, id, or CSS selector.
+3. Generate a step-by-step plan: use click_element to focus each field, then send_keys to type text.
+4. For click_element, provide a target object with identifying properties. Include the selector if available, plus label or placeholder for fallback strategies.
+5. Include coordinates as a last-resort fallback for each click_element target.
+6. If the task involves searching or submitting, include a press_enter step after typing.
+7. End with a verify_fill step listing the text values that were typed, followed by a take_screenshot step.
 
-Available actions: click_on_screen, send_keys, press_enter, take_screenshot, scroll, verify_fill.
+Available actions: click_element, focus_element, send_keys, press_enter, take_screenshot, scroll, verify_fill.
+
+Example click_element usage:
+{ "action": "click_element", "params": { "target": { "selector": "#email", "label": "Email Address", "placeholder": "Enter your email", "coordinates": { "x": 500, "y": 300 } } }, "description": "Click on email field" }
 
 Respond with a valid JSON object in this format:
 {
-  "reasoning": "Explain which fields you matched, what text you are typing, and why",
+  "reasoning": "Explain which fields you matched and what text you typed",
   "steps": [
-    { "action": "click_on_screen", "params": { "x": 100, "y": 200 }, "description": "Click on first field" },
+    { "action": "click_element", "params": { "target": { "selector": "#field-id", "label": "Field Label", "placeholder": "Placeholder text", "coordinates": { "x": 100, "y": 200 } } }, "description": "Click on first field" },
     { "action": "send_keys", "params": { "text": "value to type" }, "description": "Type value" },
     { "action": "verify_fill", "params": { "expectedValues": ["value to type"] }, "description": "Verify fields were filled" },
     { "action": "take_screenshot", "params": { "name": "after-fill" }, "description": "Take final screenshot" }
@@ -71,13 +200,30 @@ Return ONLY valid JSON. No markdown.`;
 
     if (!this.llm) throw new Error('LLM not available');
     const result = await this.llm.generateJSON<PlanResult>(prompt);
-    this.validatePlan(result);
+    this.validatePlan(result, false);
     Logger.info(`LLM generated ${result.steps.length} steps`);
     Logger.info(`LLM reasoning: ${result.reasoning}`);
     return result;
   }
 
-  private validatePlan(plan: PlanResult): void {
+  private serializeFields(analysis: PageAnalysis): unknown[] {
+    return [...analysis.inputs, ...analysis.textareas].map((f, idx) => ({
+      index: idx,
+      tag: f.tag,
+      type: f.type,
+      placeholder: f.placeholder,
+      labelText: f.labelText,
+      name: f.name,
+      id: f.id,
+      ariaLabel: f.ariaLabel,
+      textContent: f.textContent,
+      selector: f.selector,
+      centerX: Math.round(f.rect.centerX),
+      centerY: Math.round(f.rect.centerY),
+    }));
+  }
+
+  private validatePlan(plan: PlanResult, isRecovery: boolean): void {
     if (!plan || typeof plan.reasoning !== 'string' || !Array.isArray(plan.steps)) {
       throw new Error('Agent returned an invalid plan object');
     }
@@ -87,34 +233,47 @@ Return ONLY valid JSON. No markdown.`;
       if (!step.description || typeof step.description !== 'string') {
         throw new Error(`Plan step ${index + 1} has no description`);
       }
-      if (step.action === 'click_on_screen') {
-        if (!Number.isFinite(params.x) || !Number.isFinite(params.y)) {
-          throw new Error(`Plan step ${index + 1} has invalid click coordinates`);
-        }
-      } else if (step.action === 'send_keys') {
-        if (typeof params.text !== 'string' || params.text.length === 0) {
-          throw new Error(`Plan step ${index + 1} has invalid text`);
-        }
-      } else if (step.action === 'take_screenshot') {
-        if (typeof params.name !== 'string' || params.name.length === 0) {
-          throw new Error(`Plan step ${index + 1} has invalid screenshot name`);
-        }
-      } else if (step.action === 'scroll') {
-        if (!Number.isFinite(params.amount)) {
-          throw new Error(`Plan step ${index + 1} has an invalid scroll amount`);
-        }
-      } else if (step.action === 'press_enter') {
-        // press_enter takes no params
-      } else if (step.action === 'verify_fill') {
-        if (!Array.isArray(params.expectedValues) || params.expectedValues.length < 1) {
-          throw new Error(`Plan step ${index + 1} must have at least one expected value`);
-        }
-      } else {
-        throw new Error(`Plan step ${index + 1} uses unsupported action ${step.action}`);
+      switch (step.action) {
+        case 'click_element':
+        case 'focus_element':
+          if (!params.target || typeof params.target !== 'object') {
+            throw new Error(`Plan step ${index + 1} has invalid target`);
+          }
+          break;
+        case 'click_on_screen':
+          if (!Number.isFinite(params.x) || !Number.isFinite(params.y)) {
+            throw new Error(`Plan step ${index + 1} has invalid click coordinates`);
+          }
+          break;
+        case 'send_keys':
+          if (typeof params.text !== 'string' || params.text.length === 0) {
+            throw new Error(`Plan step ${index + 1} has invalid text`);
+          }
+          break;
+        case 'take_screenshot':
+          if (typeof params.name !== 'string' || params.name.length === 0) {
+            throw new Error(`Plan step ${index + 1} has invalid screenshot name`);
+          }
+          break;
+        case 'scroll':
+          if (!Number.isFinite(params.amount)) {
+            throw new Error(`Plan step ${index + 1} has an invalid scroll amount`);
+          }
+          break;
+        case 'press_enter':
+        case 'reanalyze_page':
+          break;
+        case 'verify_fill':
+          if (!Array.isArray(params.expectedValues) || params.expectedValues.length < 1) {
+            throw new Error(`Plan step ${index + 1} must have at least one expected value`);
+          }
+          break;
+        default:
+          throw new Error(`Plan step ${index + 1} uses unsupported action ${step.action}`);
       }
     }
 
-    if (!plan.steps.some((step) => step.action === 'verify_fill')) {
+    if (!isRecovery && !plan.steps.some((step) => step.action === 'verify_fill')) {
       throw new Error('Agent plan does not verify the filled values');
     }
   }
@@ -139,6 +298,22 @@ Return ONLY valid JSON. No markdown.`;
     }
 
     return { textToType: task, targetKeywords: [] };
+  }
+
+  private buildTargetFromElement(el: PageElement): ElementTarget {
+    const target: ElementTarget = {
+      selector: el.selector || undefined,
+      label: el.labelText || undefined,
+      placeholder: el.placeholder || undefined,
+      ariaLabel: el.ariaLabel || undefined,
+      textContent: el.textContent || undefined,
+      tag: el.tag,
+      name: el.name || undefined,
+      id: el.id || undefined,
+      type: el.type || undefined,
+      coordinates: { x: el.rect.centerX, y: el.rect.centerY },
+    };
+    return target;
   }
 
   private planWithHeuristics(task: string, analysis: PageAnalysis): PlanResult {
@@ -184,9 +359,9 @@ Return ONLY valid JSON. No markdown.`;
 
     if (primaryField) {
       steps.push({
-        action: 'click_on_screen',
-        params: { x: primaryField.rect.centerX, y: primaryField.rect.centerY },
-        description: `Click on input (${primaryField.labelText || primaryField.placeholder || 'field'})`,
+        action: 'click_element',
+        params: { target: this.buildTargetFromElement(primaryField) },
+        description: `Click on input (${primaryField.labelText || primaryField.placeholder || primaryField.selector || 'field'})`,
       });
       steps.push({
         action: 'send_keys',
@@ -204,9 +379,9 @@ Return ONLY valid JSON. No markdown.`;
       );
       if (descField && (!primaryField || descField.rect.centerY !== primaryField.rect.centerY)) {
         steps.push({
-          action: 'click_on_screen',
-          params: { x: descField.rect.centerX, y: descField.rect.centerY },
-          description: `Click on description field (${descField.labelText || descField.placeholder || 'field'})`,
+          action: 'click_element',
+          params: { target: this.buildTargetFromElement(descField) },
+          description: `Click on description field (${descField.labelText || descField.placeholder || descField.selector || 'field'})`,
         });
         steps.push({
           action: 'send_keys',

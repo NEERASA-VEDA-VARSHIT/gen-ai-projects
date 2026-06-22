@@ -3,12 +3,15 @@ export type ActionType =
   | 'navigate_to_url'
   | 'take_screenshot'
   | 'click_on_screen'
+  | 'click_element'
+  | 'focus_element'
   | 'double_click'
   | 'send_keys'
   | 'press_enter'
   | 'scroll'
   | 'analyze_page'
-  | 'verify_fill';
+  | 'verify_fill'
+  | 'reanalyze_page';
 
 export interface Step {
   action: ActionType;
@@ -25,6 +28,19 @@ export interface PageElementRect {
   centerY: number;
 }
 
+export interface ElementTarget {
+  selector?: string;
+  label?: string;
+  placeholder?: string;
+  ariaLabel?: string;
+  textContent?: string;
+  tag?: string;
+  name?: string;
+  id?: string;
+  type?: string;
+  coordinates?: { x: number; y: number };
+}
+
 export interface PageElement {
   tag: string;
   id: string | null;
@@ -34,6 +50,7 @@ export interface PageElement {
   ariaLabel: string | null;
   textContent: string | null;
   labelText: string | null;
+  selector: string;
   rect: PageElementRect;
 }
 
