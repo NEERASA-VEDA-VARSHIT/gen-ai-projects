@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { generateGeminiAnswer } from '@/lib/gemini';
 import { buildGroundedPrompt, type RetrievedChunk } from '@/lib/rag/prompt';
 import { createEmbedding } from '@/lib/rag/embed';
+import { rewriteQuery } from '@/lib/rag/rewrite';
+import { rerankChunks } from '@/lib/rag/rerank';
 import { retrieveTopChunks, retrieveWithExpansion } from '@/lib/rag/retrieve';
 import { evaluateRetrieval, evaluateBySimilarity } from '@/lib/rag/evaluate';
 
@@ -12,18 +14,21 @@ async function correctRetrieval(
   documentId: string,
   queryEmbedding: number[]
 ): Promise<{ chunks: RetrievedChunk[]; corrected: boolean }> {
-  const chunks = await retrieveTopChunks(documentId, queryEmbedding, { limit: 5 });
+  const chunks = await retrieveTopChunks(documentId, queryEmbedding, { limit: 20 });
 
-  const similarityOk = evaluateBySimilarity(chunks, 0.55);
+  const reranked = await rerankChunks(question, chunks);
+  const top5 = reranked.slice(0, 5);
+
+  const similarityOk = evaluateBySimilarity(top5, 0.55);
 
   if (similarityOk === 'sufficient') {
-    const llmCheck = await evaluateRetrieval(question, chunks);
+    const llmCheck = await evaluateRetrieval(question, top5);
     if (llmCheck.verdict === 'sufficient') {
-      return { chunks, corrected: false };
+      return { chunks: top5, corrected: false };
     }
   }
 
-  const expanded = await retrieveWithExpansion(documentId, queryEmbedding);
+  const expanded = await retrieveWithExpansion(documentId, question, queryEmbedding);
 
   return { chunks: expanded, corrected: true };
 }
@@ -42,7 +47,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Document ID is required. Upload a document first.' }, { status: 400 });
     }
 
-    const questionEmbedding = await createEmbedding(question);
+    const rewrittenQuery = await rewriteQuery(question);
+    const questionEmbedding = await createEmbedding(rewrittenQuery);
     const { chunks, corrected } = await correctRetrieval(question, documentId, questionEmbedding);
     const prompt = buildGroundedPrompt(question, chunks);
     const answer = await generateGeminiAnswer(prompt);
@@ -50,7 +56,8 @@ export async function POST(request: Request) {
     return NextResponse.json({
       answer,
       sources: chunks,
-      corrected
+      corrected,
+      rewrittenQuery
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Chat failed';

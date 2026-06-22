@@ -1,4 +1,7 @@
 import { getSupabaseClient } from '../supabase';
+import { createEmbedding } from './embed';
+import { expandQueries } from './rewrite';
+import { rerankChunks } from './rerank';
 import type { RetrievedChunk } from './prompt';
 
 type RetrieveOptions = {
@@ -29,11 +32,12 @@ export async function retrieveTopChunks(
 
 export async function retrieveWithExpansion(
   documentId: string,
+  question: string,
   originalEmbedding: number[]
 ): Promise<RetrievedChunk[]> {
   const [moreChunks, reformulatedChunks] = await Promise.all([
     retrieveTopChunks(documentId, originalEmbedding, { limit: 20, threshold: 0.1 }),
-    retrieveReformulated(documentId, originalEmbedding),
+    retrieveReformulated(documentId, question),
   ]);
 
   const seen = new Set<number>();
@@ -43,24 +47,26 @@ export async function retrieveWithExpansion(
     return true;
   });
 
-  return merged.sort((a, b) => b.similarity - a.similarity).slice(0, 10);
+  const sorted = merged.sort((a, b) => b.similarity - a.similarity).slice(0, 20);
+
+  return rerankChunks(question, sorted).then(reranked => reranked.slice(0, 10));
 }
 
 async function retrieveReformulated(
   documentId: string,
-  originalEmbedding: number[]
+  question: string
 ): Promise<RetrievedChunk[]> {
-  const supabase = getSupabaseClient();
-  const { data, error } = await supabase.rpc('match_document_chunks', {
-    query_embedding: originalEmbedding,
-    match_document_id: documentId,
-    match_threshold: 0.1,
-    match_count: 10
-  });
+  const alternativeQueries = await expandQueries(question);
 
-  if (error) {
-    throw new Error(error.message);
-  }
+  const allEmbeddings = await Promise.all(
+    alternativeQueries.map(q => createEmbedding(q))
+  );
 
-  return (data ?? []) as RetrievedChunk[];
+  const results = await Promise.all(
+    allEmbeddings.map(embedding =>
+      retrieveTopChunks(documentId, embedding, { limit: 10, threshold: 0.1 })
+    )
+  );
+
+  return results.flat();
 }
