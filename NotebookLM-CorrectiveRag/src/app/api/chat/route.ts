@@ -3,6 +3,7 @@ import { generateGeminiAnswer } from '@/lib/gemini';
 import { buildGroundedPrompt, type RetrievedChunk } from '@/lib/rag/prompt';
 import { createEmbedding } from '@/lib/rag/embed';
 import { rewriteQuery } from '@/lib/rag/rewrite';
+import { generateHypotheticalDocument } from '@/lib/rag/hyde';
 import { rerankChunks } from '@/lib/rag/rerank';
 import { retrieveTopChunks, retrieveWithExpansion } from '@/lib/rag/retrieve';
 import { evaluateRetrieval, evaluateBySimilarity } from '@/lib/rag/evaluate';
@@ -38,6 +39,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     const question = String(body.question ?? '').trim();
     const documentId = String(body.documentId ?? '').trim();
+    const useHyde = body.useHyde === true;
 
     if (!question) {
       return NextResponse.json({ error: 'Question is required' }, { status: 400 });
@@ -48,7 +50,15 @@ export async function POST(request: Request) {
     }
 
     const rewrittenQuery = await rewriteQuery(question);
-    const questionEmbedding = await createEmbedding(rewrittenQuery);
+
+    let searchText: string;
+    if (useHyde) {
+      searchText = await generateHypotheticalDocument(rewrittenQuery);
+    } else {
+      searchText = rewrittenQuery;
+    }
+
+    const questionEmbedding = await createEmbedding(searchText);
     const { chunks, corrected } = await correctRetrieval(question, documentId, questionEmbedding);
     const prompt = buildGroundedPrompt(question, chunks);
     const answer = await generateGeminiAnswer(prompt);
@@ -57,7 +67,8 @@ export async function POST(request: Request) {
       answer,
       sources: chunks,
       corrected,
-      rewrittenQuery
+      rewrittenQuery,
+      hydeUsed: useHyde
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Chat failed';

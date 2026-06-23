@@ -27,6 +27,7 @@ export function DocumentStudio() {
   const [error, setError] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [isAsking, setIsAsking] = useState(false);
+  const [useHyde, setUseHyde] = useState(false);
 
   const onDrop = (acceptedFiles: File[]) => {
     setError('');
@@ -100,7 +101,8 @@ export function DocumentStudio() {
         },
         body: JSON.stringify({
           documentId: uploadState.documentId,
-          question
+          question,
+          useHyde
         })
       });
 
@@ -199,15 +201,39 @@ export function DocumentStudio() {
             placeholder="Ask something like: What is the revenue growth?"
             className="w-full rounded-2xl border border-white/10 bg-white/[0.03] px-4 py-3 text-sm text-white outline-none transition placeholder:text-slate-500 focus:border-emerald-400/50"
           />
-          <button
-            type="button"
-            onClick={handleAsk}
-            disabled={!canAsk || isAsking}
-            className="inline-flex items-center gap-2 rounded-full bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {isAsking ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUpRight className="h-4 w-4" />}
-            {isAsking ? 'Generating' : 'Ask document'}
-          </button>
+          <div className="flex items-center justify-between gap-4">
+            <label className="flex cursor-pointer items-center gap-3">
+              <button
+                type="button"
+                role="switch"
+                aria-checked={useHyde}
+                onClick={() => setUseHyde(!useHyde)}
+                className={cn(
+                  'relative inline-flex h-5 w-9 shrink-0 rounded-full border border-white/10 transition-colors',
+                  useHyde ? 'bg-emerald-400' : 'bg-white/10'
+                )}
+              >
+                <span
+                  className={cn(
+                    'inline-block h-4 w-4 translate-x-0.5 rounded-full bg-white transition-transform',
+                    useHyde && 'translate-x-4'
+                  )}
+                />
+              </button>
+              <span className="text-sm text-slate-300">
+                HyDE <span className="text-xs text-slate-500">(hypothetical document embedding)</span>
+              </span>
+            </label>
+            <button
+              type="button"
+              onClick={handleAsk}
+              disabled={!canAsk || isAsking}
+              className="inline-flex items-center gap-2 rounded-full bg-cyan-400 px-4 py-2 text-sm font-medium text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isAsking ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUpRight className="h-4 w-4" />}
+              {isAsking ? 'Generating' : 'Ask document'}
+            </button>
+          </div>
         </div>
 
         {error ? <div className="mt-4 rounded-2xl border border-red-400/30 bg-red-500/10 px-4 py-3 text-sm text-red-200">{error}</div> : null}
