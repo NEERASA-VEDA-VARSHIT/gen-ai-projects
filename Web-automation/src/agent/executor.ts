@@ -213,17 +213,18 @@ export class Executor {
           (elements: Element[]) =>
             elements.map((element) => (element as HTMLInputElement).value)
         );
-        Logger.info('Non-empty field values after fill: ' + JSON.stringify(values.filter(Boolean)));
+        const nonEmptyCount = values.filter(Boolean).length;
+        Logger.info(`Non-empty field values after fill: ${nonEmptyCount} field(s)`);
         const missing = expectedValues.filter((expected) => !values.includes(expected));
         if (expectedValues.length === 0 || missing.length > 0) {
           return {
             success: false,
             error: expectedValues.length === 0
               ? 'Verification requires expectedValues'
-              : `Expected field values not found: ${JSON.stringify(missing)}`,
+              : `Expected ${expectedValues.length} value(s), ${missing.length} missing`,
           };
         }
-        return { success: true, data: values };
+        return { success: true, data: { filled: nonEmptyCount } };
       }
 
       default:

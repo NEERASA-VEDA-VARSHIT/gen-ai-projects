@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { redactSensitive } from '@/safety/redactor';
 
 type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'SUCCESS';
 
@@ -36,7 +37,8 @@ export class Logger {
   static logs: string[] = [];
 
   private static add(level: LogLevel, message: string): void {
-    const formatted = formatMessage(level, message);
+    const redacted = redactSensitive(message);
+    const formatted = formatMessage(level, redacted);
     Logger.logs.push(formatted);
     console.log(`${colors[level]}${formatted}${reset}`);
     writeToFile(formatted);

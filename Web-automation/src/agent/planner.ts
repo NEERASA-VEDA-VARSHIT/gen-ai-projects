@@ -1,12 +1,27 @@
 import type { Step, PlanResult, PageAnalysis, ElementTarget, PageElement } from '@/types/agent';
 import type { LLMProvider } from '@/llm/types';
 import { Logger } from '@/logger/logger';
+import { guardPlanOutput, OutputGuardError } from '@/safety/output-guard';
+import { InputJudge, JudgeTripwireError } from '@/safety/judge-guard';
 
 export class Planner {
   constructor(private llm: LLMProvider | null) {}
 
   async generatePlan(task: string, analysis: PageAnalysis): Promise<PlanResult> {
     Logger.info('Generating field-filling plan from page analysis...');
+
+    if (this.llm) {
+      try {
+        const judge = await InputJudge.create();
+        await judge.guard(task);
+      } catch (error) {
+        if (error instanceof JudgeTripwireError) {
+          Logger.warn(`Input blocked by judge: ${error.message}`);
+          throw error;
+        }
+        Logger.warn(`Judge unavailable, skipping: ${String(error)}`);
+      }
+    }
 
     if (this.llm) {
       try {
@@ -25,6 +40,19 @@ export class Planner {
     failedStep: Step
   ): Promise<PlanResult> {
     Logger.info('Generating recovery plan...');
+
+    if (this.llm) {
+      try {
+        const judge = await InputJudge.create();
+        await judge.guard(task);
+      } catch (error) {
+        if (error instanceof JudgeTripwireError) {
+          Logger.warn(`Recovery input blocked by judge: ${error.message}`);
+          throw error;
+        }
+        Logger.warn(`Judge unavailable for recovery, skipping: ${String(error)}`);
+      }
+    }
 
     if (this.llm) {
       try {
@@ -79,10 +107,11 @@ Respond with a valid JSON object:
 Return ONLY valid JSON. No markdown.`;
 
     if (!this.llm) throw new Error('LLM not available');
-    const result = await this.llm.generateJSON<PlanResult>(prompt);
-    this.validatePlan(result, true);
-    Logger.info(`LLM generated ${result.steps.length} recovery steps`);
-    return result;
+    const raw = await this.llm.generateJSON<PlanResult>(prompt);
+    const guarded = guardPlanOutput(raw);
+    this.validatePlan(guarded, true);
+    Logger.info(`LLM generated ${guarded.steps.length} recovery steps`);
+    return guarded;
   }
 
   private planRecoveryWithHeuristics(
@@ -199,11 +228,12 @@ Respond with a valid JSON object in this format:
 Return ONLY valid JSON. No markdown.`;
 
     if (!this.llm) throw new Error('LLM not available');
-    const result = await this.llm.generateJSON<PlanResult>(prompt);
-    this.validatePlan(result, false);
-    Logger.info(`LLM generated ${result.steps.length} steps`);
-    Logger.info(`LLM reasoning: ${result.reasoning}`);
-    return result;
+    const raw = await this.llm.generateJSON<PlanResult>(prompt);
+    const guarded = guardPlanOutput(raw);
+    this.validatePlan(guarded, false);
+    Logger.info(`LLM generated ${guarded.steps.length} steps`);
+    Logger.info(`LLM reasoning: ${guarded.reasoning}`);
+    return guarded;
   }
 
   private serializeFields(analysis: PageAnalysis): unknown[] {

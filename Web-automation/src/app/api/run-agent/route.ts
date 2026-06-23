@@ -1,11 +1,67 @@
 import { NextRequest } from 'next/server';
 import { BrowserAgent } from '@/agent/browser-agent';
 import { Logger } from '@/logger/logger';
+import { validateAndSanitize, GuardError } from '@/safety/input-guard';
+import { sanitizeErrorMessage } from '@/safety/redactor';
+import { InputJudge, JudgeTripwireError } from '@/safety/judge-guard';
+
+const MAX_BODY_BYTES = 1_048_576;
 
 export async function POST(request: NextRequest) {
-  const body = await request.json().catch(() => ({}));
-  const task: string = body.task || 'Find the Name and Description form fields on the page and fill them with test values.';
-  const url: string = body.url || 'https://ui.shadcn.com/docs/forms/react-hook-form';
+  const contentType = request.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    return new Response(
+      JSON.stringify({ error: 'Content-Type must be application/json' }),
+      { status: 415, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  let body: Record<string, unknown>;
+  try {
+    const text = await request.text();
+    if (Buffer.byteLength(text, 'utf-8') > MAX_BODY_BYTES) {
+      return new Response(
+        JSON.stringify({ error: `Request body exceeds ${MAX_BODY_BYTES} bytes` }),
+        { status: 413, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    body = JSON.parse(text);
+  } catch {
+    return new Response(
+      JSON.stringify({ error: 'Invalid JSON body' }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  const rawTask: string = (body.task as string) || 'Find the Name and Description form fields on the page and fill them with test values.';
+  const rawUrl: string = (body.url as string) || 'https://ui.shadcn.com/docs/forms/react-hook-form';
+
+  let task: string;
+  let url: string;
+  try {
+    const validated = validateAndSanitize(rawTask, rawUrl);
+    task = validated.task;
+    url = validated.url;
+  } catch (error) {
+    const message = error instanceof GuardError ? error.message : sanitizeErrorMessage(error);
+    return new Response(
+      JSON.stringify({ error: `Input validation failed: ${message}` }),
+      { status: 400, headers: { 'Content-Type': 'application/json' } }
+    );
+  }
+
+  try {
+    const judge = await InputJudge.create();
+    await judge.guard(task);
+  } catch (error) {
+    if (error instanceof JudgeTripwireError) {
+      return new Response(
+        JSON.stringify({ error: `Input blocked by safety judge: ${error.message}` }),
+        { status: 403, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    Logger.warn(`Judge unavailable in API, proceeding: ${String(error)}`);
+  }
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
@@ -28,7 +84,11 @@ export async function POST(request: NextRequest) {
       try {
         const agent = new BrowserAgent();
         const result = await agent.run(task, url);
-        const payload = JSON.stringify({ type: 'result', payload: result });
+        const safeResult = {
+          ...result,
+          errors: result.errors.map(sanitizeErrorMessage),
+        };
+        const payload = JSON.stringify({ type: 'result', payload: safeResult });
         controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
       } catch (error) {
         const payload = JSON.stringify({
@@ -38,7 +98,7 @@ export async function POST(request: NextRequest) {
             summary: 'Agent crashed',
             status: 'failed',
             screenshots: [],
-            errors: [String(error)],
+            errors: [sanitizeErrorMessage(error)],
             completedActions: 0,
           },
         });

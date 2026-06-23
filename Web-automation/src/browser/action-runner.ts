@@ -4,6 +4,8 @@ import fs from 'fs';
 import { Logger } from '@/logger/logger';
 import type { ActionResult, ElementTarget } from '@/types/agent';
 import { ElementFinder } from './element-finder';
+import { validateNavigationUrl } from '@/safety/input-guard';
+import { redactTypedText } from '@/safety/redactor';
 
 const SCREENSHOT_DIR = path.resolve(process.cwd(), 'screenshots');
 
@@ -22,9 +24,10 @@ export class ActionRunner {
 
   async navigate(url: string): Promise<ActionResult> {
     try {
-      Logger.info(`Navigating to ${url}`);
-      await this.page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-      Logger.success(`Reached ${url}`);
+      const safeUrl = validateNavigationUrl(url);
+      Logger.info(`Navigating to ${safeUrl}`);
+      await this.page.goto(safeUrl, { waitUntil: 'networkidle', timeout: 30000 });
+      Logger.success(`Reached ${safeUrl}`);
       return { success: true };
     } catch (error) {
       Logger.error(`Navigation failed: ${String(error)}`);
@@ -140,12 +143,12 @@ export class ActionRunner {
 
   async type(text: string): Promise<ActionResult> {
     try {
-      Logger.info(`Typing text: "${text}"`);
+      Logger.info(`Typing text: "${redactTypedText(text)}"`);
       await this.page.keyboard.press('Control+a');
       await this.page.keyboard.press('Delete');
       await this.page.waitForTimeout(50);
       await this.page.keyboard.type(text, { delay: 30 });
-      Logger.success(`Typed text: "${text}"`);
+      Logger.success(`Typed text: "${redactTypedText(text)}"`);
       return { success: true };
     } catch (error) {
       Logger.error(`Type failed: ${String(error)}`);
